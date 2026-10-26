@@ -1,5 +1,6 @@
 package com.saas.billing;
 
+import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -15,47 +16,53 @@ public class SubscriptionBillingService {
     private static final String DB_USER = "admin";
     private static final String DB_PASS = "admin123";
 
-    public List<String> processMonthlyBilling(String customerId, String planType, double basePrice, 
-                                             String signupDateStr, int overdueDays, String promoCode, 
-                                             boolean isNonProfit, String paymentCardToken) {
+    private static final BigDecimal NON_PROFIT_FACTOR = new BigDecimal("0.70");
+    private static final BigDecimal WELCOME10_FACTOR = new BigDecimal("0.90");
+    private static final Money BLACKFRIDAY_DISCOUNT = Money.of("30.00");
+    private static final BigDecimal LATE_PENALTY_RATE = new BigDecimal("0.02");
+    private static final BigDecimal DAILY_INTEREST_RATE = new BigDecimal("0.001");
+
+    public List<String> processMonthlyBilling(BillingCommand command) {
 
         List<String> logs = new ArrayList<>();
-        
-        LocalDate signupDate = LocalDate.parse(signupDateStr);
+
+        LocalDate signupDate = command.signupDate();
         LocalDate today = LocalDate.now();
 
         int monthsActive = (today.getYear() - signupDate.getYear()) * 12 + (today.getMonthValue() - signupDate.getMonthValue());
 
-        double calculatedPrice = basePrice;
+        Money basePrice = command.basePrice();
+        Money calculatedPrice = basePrice;
 
         if (monthsActive > 24) {
-            calculatedPrice = calculatedPrice - (basePrice * 0.15); // 15% após 2 anos
+            calculatedPrice = calculatedPrice.minus(basePrice.percent(15)); // 15% após 2 anos
         } else if (monthsActive > 12) {
-            calculatedPrice = calculatedPrice - (basePrice * 0.10); // 10% após 1 ano
+            calculatedPrice = calculatedPrice.minus(basePrice.percent(10)); // 10% após 1 ano
         }
 
-        if (isNonProfit) {
-            calculatedPrice = calculatedPrice * 0.70; // 30% off para ONGs
+        if (command.nonProfit()) {
+            calculatedPrice = calculatedPrice.times(NON_PROFIT_FACTOR); // 30% off para ONGs
         }
 
+        String promoCode = command.promoCode();
         if (promoCode != null && !promoCode.trim().isEmpty()) {
             if (promoCode.equalsIgnoreCase("BLACKFRIDAY") && today.getMonthValue() == 11) {
-                calculatedPrice = calculatedPrice - 30.0;
+                calculatedPrice = calculatedPrice.minus(BLACKFRIDAY_DISCOUNT);
             } else if (promoCode.equalsIgnoreCase("WELCOME10") && monthsActive <= 1) {
-                calculatedPrice = calculatedPrice * 0.90;
+                calculatedPrice = calculatedPrice.times(WELCOME10_FACTOR);
             }
         }
 
+        int overdueDays = command.overdueDays();
         if (overdueDays > 0) {
-            double penalty = calculatedPrice * 0.02;
-            double dailyInterest = (calculatedPrice * 0.001) * overdueDays;
-            calculatedPrice = calculatedPrice + penalty + dailyInterest;
+            Money penalty = calculatedPrice.times(LATE_PENALTY_RATE);
+            Money dailyInterest = calculatedPrice.times(DAILY_INTEREST_RATE).times(overdueDays);
+            calculatedPrice = calculatedPrice.plus(penalty).plus(dailyInterest);
         }
 
-        if (calculatedPrice < 0) {
-            calculatedPrice = 0.0;
-        }
+        calculatedPrice = calculatedPrice.atLeastZero();
 
+        String customerId = command.customerId();
         try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {
             String sqlCustomer = "SELECT email, status FROM customers WHERE id = ?";
             PreparedStatement stmt = conn.prepareStatement(sqlCustomer);
@@ -72,6 +79,7 @@ public class SubscriptionBillingService {
                 }
 
                 boolean paymentSuccess = false;
+                String paymentCardToken = command.paymentCardToken();
                 if (paymentCardToken != null && paymentCardToken.startsWith("tok_")) {
                     paymentSuccess = true;
                     logs.add("Pagamento processado com sucesso: R$ " + calculatedPrice);
@@ -82,7 +90,7 @@ public class SubscriptionBillingService {
                 String sqlInvoice = "INSERT INTO invoices(customer_id, amount, status, created_at) VALUES (?, ?, ?, NOW())";
                 PreparedStatement stmtInvoice = conn.prepareStatement(sqlInvoice);
                 stmtInvoice.setString(1, customerId);
-                stmtInvoice.setDouble(2, calculatedPrice);
+                stmtInvoice.setBigDecimal(2, calculatedPrice.rounded());
                 stmtInvoice.setString(3, paymentSuccess ? "PAID" : "FAILED");
                 stmtInvoice.executeUpdate();
 
